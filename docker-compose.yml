@@ -1,0 +1,16 @@
+services:
+  nexus-pg-vector:
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/ankane/pgvector:v0.5.1
+    container_name: nexus_knowledge_db
+    environment:
+      POSTGRES_USER: nexus_root
+      POSTGRES_PASSWORD: AeroOS_Password2026!
+      POSTGRES_DB: nexus_aero_os
+    ports:
+      - "5432:5432"
+    volumes:
+      - nexus_pg_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  nexus_pg_data:

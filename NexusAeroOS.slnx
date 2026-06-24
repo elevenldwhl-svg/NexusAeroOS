@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/解决方案项/">
+    <File Path="docker-compose.yml" />
+  </Folder>
+  <Project Path="NexusAeroOS.AgentHarness/NexusAeroOS.AgentHarness.csproj" />
+  <Project Path="NexusAeroOS.Domain/NexusAeroOS.Domain.csproj" />
+  <Project Path="NexusAeroOS.Host/NexusAeroOS.Host.csproj" />
+</Solution>
