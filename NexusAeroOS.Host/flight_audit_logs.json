@@ -1,0 +1,22 @@
+[
+  {
+    "Id": "27202eaa-d46d-42f1-bc99-6914e518fcec",
+    "DroneId": "Drone-Unknown",
+    "ActionType": "Agent-Routing-Decision",
+    "UserInput": "\u8981\u70B8\u673A\u4E86\uFF01\u5C4F\u5E55\u5168\u9ED1\uFF0C\u6CA1\u6709\u4EFB\u4F55\u53C2\u6570\u663E\u793A\uFF01\u6551\u547D\uFF01",
+    "AiReasoning": "\u601D\u8003\u94FE\u4E0E\u5DE5\u5177\u8C03\u7528\u5DF2\u7531 AgentObservabilityFilter \u62E6\u622A\u6253\u5370",
+    "ToolExecuted": "Auto-Routed",
+    "IsCritical": true,
+    "Timestamp": "2026-06-24T14:08:29.1582835Z"
+  },
+  {
+    "Id": "46588690-f54a-4312-a330-f0b10929e76b",
+    "DroneId": "Drone-Unknown",
+    "ActionType": "Agent-Routing-Decision",
+    "UserInput": "\u8981\u70B8\u673A\u4E86\uFF01\u5C4F\u5E55\u5168\u9ED1\uFF0C\u6CA1\u6709\u4EFB\u4F55\u53C2\u6570\u663E\u793A\uFF01\u6551\u547D\uFF01",
+    "AiReasoning": "\u601D\u8003\u94FE\u4E0E\u5DE5\u5177\u8C03\u7528\u5DF2\u7531 AgentObservabilityFilter \u62E6\u622A\u6253\u5370",
+    "ToolExecuted": "Auto-Routed",
+    "IsCritical": true,
+    "Timestamp": "2026-06-24T14:13:43.0424623Z"
+  }
+]

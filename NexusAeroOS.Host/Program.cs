@@ -1,138 +1,132 @@
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Embeddings;
 using NexusAeroOS.AgentHarness.Agents;
 using NexusAeroOS.AgentHarness.Infrastructure;
 using NexusAeroOS.AgentHarness.Plugins;
+using NexusAeroOS.Host.Hubs;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // ====================================================================
-// 阶段一：底座构建期
+// 阶段一：服务注册与依赖注入 (Dependency Injection)
 // ====================================================================
 string apiKey = "sk-fbioafzjlizupncpgjoonszbeheoxhiqndybsakwlfvwdycq";
 string pgConnectionString = "Host=localhost;Port=5432;Database=nexus_aero_os;Username=nexus_root;Password=AeroOS_Password2026!";
 
-// 实例化我们刚才手写的底层拦截器客户端
-var customHttpClient = new HttpClient(new SiliconFlowInterceptor());
-
-var kernelBuilder = Kernel.CreateBuilder();
-
-// 注册 Chat 引擎，注入拦截客户端（SDK 无论怎么发向 OpenAI，都会被底层强行劫持到硅基流动）
-kernelBuilder.AddOpenAIChatCompletion(
-    modelId: "deepseek-ai/DeepSeek-V3.2",
-    apiKey: apiKey,
-    httpClient: customHttpClient
-);
-
-// 注册 Embedding 引擎，注入同一个拦截客户端
-kernelBuilder.AddOpenAITextEmbeddingGeneration(
-    modelId: "BAAI/bge-m3",
-    apiKey: apiKey,
-    httpClient: customHttpClient
-);
-
-var kernel = kernelBuilder.Build();
-
-// ====================================================================
-// 阶段二：数据预热期
-// ====================================================================
-Console.WriteLine("\n[系统自检] 正在校验 PostgreSQL 存储引擎与 HNSW 向量索引...");
-var vectorRepo = new VectorKnowledgeRepository(pgConnectionString);
-await vectorRepo.EnsureSchemaAsync();
-
-var embeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
-var ingestionService = new KnowledgeIngestionService(embeddingService, vectorRepo);
-
-string corporateSopDocument = """
-    # 星河物流低空飞控核心章程 v2.6
-    ## 第一章：动力失控红线与紧急处置机制
-    凡属于低空货运序列的无人机飞行器，在执行任务期间，机载传感器触发【BatteryTemp > 65℃】核心热失控红线时，主控系统必须在一秒钟内强制剥离自主导航状态，由脑干中枢强行接管飞行权限。
-    ## 第二章：特种医疗载荷调度规则
-    若涉事飞行器的 CurrentPayload 字段标记为【RH阴性活体血浆】或【紧急特种药品】，该运单的生存优先级自动提升为 A1 级（最高级别）。调度智能体被赋予最高物理干涉主权，允许静默调用下游仓储管理系统（WMS）锁死安全冗余物资，无需人工二次审批。
-    ## 第三章：备用接驳仓寻址规范
-    当触发一级应急干涉时，系统寻址机制应优先锁定距离当前坐标最近的特种接驳仓。其中，“深圳-南山1号特种接驳仓”作为核心医疗枢纽，全天候预留 SKU-BAT-999（低空高倍率石墨烯固态电池）作为战略热冗余储备。
-    """;
-
-Console.WriteLine("[系统自检] 正在执行常识规章的智能切片与 Embedding 向量化沉淀...");
-await ingestionService.IngestDocumentAsync(corporateSopDocument);
-Console.WriteLine("[系统自检] 知识库同步完毕，RAG 记忆体已上线。\n");
-
-// ====================================================================
-// 阶段三：业务运行时 (💥 核心重构区：动态 RAG 激活)
-// ====================================================================
-Console.WriteLine("🚀 Nexus-AeroOS 低空物流全息中台...点火就绪！\n");
-
-var parsingAgent = new TelemetryParsingAgent(kernel);
-string dirtyVoice = "呼叫塔台！操，南山4号接驳机刚才在飞过大南山的时候被雷电擦了一下，现在经度113.93，纬度22.54。我干，看大屏它电池核心温直接飙到69度了！电量只剩百分之十二！它货舱里装的是南山医院急要的RH阴性活体血浆，随时会炸机，快评估！";
-
-Console.WriteLine($"[地面飞控语音捕获]: \"{dirtyVoice}\"");
-var telemetry = await parsingAgent.ExtractFromPilotVoiceAsync(dirtyVoice);
-
-if (telemetry != null && telemetry.BatteryTemp > 65)
+// 1. 注册底层 HttpClient (单例)
+builder.Services.AddSingleton<HttpClient>(sp =>
 {
-    Console.ForegroundColor = ConsoleColor.Red;
-    Console.WriteLine($"🚨 [脑干中枢审查]: 涉事机 {telemetry.DroneId} 核心温 {telemetry.BatteryTemp}℃ 突破红线！静默接管飞行控制权！");
-    Console.ResetColor();
+    var client = new HttpClient(new SiliconFlowInterceptor());
+    client.Timeout = TimeSpan.FromMinutes(5); // 显式设置超时时间
+    return client;
+});
 
-    // 1. 初始化实时检索服务
-    var retrievalService = new KnowledgeRetrievalService(embeddingService, vectorRepo);
+// 2. 注册 Semantic Kernel (Transient: 每次请求创建新实例，避免并发 Plugin 污染)
+builder.Services.AddTransient<Kernel>(sp =>
+{
+    var httpClient = sp.GetRequiredService<HttpClient>();
+    var kernelBuilder = Kernel.CreateBuilder();
+    kernelBuilder.AddOpenAIChatCompletion("deepseek-ai/DeepSeek-V4-Pro", apiKey, httpClient: httpClient);
+    kernelBuilder.AddOpenAITextEmbeddingGeneration("BAAI/bge-m3", apiKey, httpClient: httpClient);
+    return kernelBuilder.Build();
+});
 
-    // 2. 提取当前事故的业务意图，并在本地进行高性能向量召回
-    string searchQuery = $"无人机电池温度达到 {telemetry.BatteryTemp} 度，货舱载荷为 {telemetry.CurrentPayload} 的特种应急预案与电池更换申请";
-    Console.WriteLine($"\n[RAG 路由激活] 正在根据遥测意图检索 HNSW 知识库...");
-    string ragContext = await retrievalService.GetRagContextAsync(searchQuery);
+// 显式将 Kernel 内部的 Embedding 服务暴露给 ASP.NET Core 外部容器
+builder.Services.AddTransient<ITextEmbeddingGenerationService>(sp =>
+{
+    var kernel = sp.GetRequiredService<Kernel>();
+    return kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+});
 
-    // 打印召回证据查看
-    Console.ForegroundColor = ConsoleColor.DarkGray;
-    Console.WriteLine(ragContext);
-    Console.ResetColor();
+// 3. 注册仓储与业务服务
+builder.Services.AddSingleton(new VectorKnowledgeRepository(pgConnectionString));
 
-    // 3. 将装配好的动态上下文，注入 AI 军师的决策流中
-    kernel.Plugins.AddFromType<UavEmergencyPlugin>("EmergencyOps");
-    var chatService = kernel.GetRequiredService<IChatCompletionService>();
-    var history = new ChatHistory();
+// 💥 修改：注册基于 Dapper 的 Postgres 审计仓储，并注入连接字符串
+builder.Services.AddSingleton(new AuditLogRepository(pgConnectionString));
+// 💥 新增：注册机队状态机 (全局单例，保证大模型每次查询的都是同一个数字停机坪)
+builder.Services.AddSingleton<FleetRegistryService>();
+builder.Services.AddTransient<KnowledgeIngestionService>();
+builder.Services.AddTransient<KnowledgeRetrievalService>();
+builder.Services.AddTransient<TelemetryParsingAgent>();
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<IAgentEventBroadcaster, SignalRAgentBroadcaster>();
+builder.Services.AddSingleton<NexusAeroOS.AgentHarness.Infrastructure.HitlApprovalService>();
+builder.Services.AddTransient<NexusAeroOS.AgentHarness.Agents.DroneOnboardAgent>();
+// 新增：向容器注册控制器服务
+builder.Services.AddControllers();
 
-    string dynamicTriagePrompt = $"""
-    你是一个低空物流中台的【中央决策军师】。
-    请阅读下述实时机载物理遥测事实，并结合从公司知识库中动态召回的安全行动依据，自主抉择是否调用物理干涉工具。
+// 新增：注册 Swagger 核心服务与 API 资源管理器
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
 
-    【当前机载物理遥测事实】
-    机号：{telemetry.DroneId}
-    坐标：({telemetry.Longitude}, {telemetry.Latitude})
-    当前电池温：{telemetry.BatteryTemp} ℃
-    货舱载荷：{telemetry.CurrentPayload}
-    飞行器状态：{telemetry.FlightStatus}
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", policy =>
+    {
+        policy.WithOrigins("http://localhost:5173") // React 运行地址
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials(); // SignalR 必须允许凭证
+    });
+});
 
-    {ragContext}
+var app = builder.Build();
 
-    【核心指令】
-    请严格基于上述召回的依据进行逻辑判定。如果满足动作红线，请调用工具。
-    成功调用工具并拿到物理派工单后，请用军工塔台口吻向全网播报最终的物理干涉回执，并在广播中明确指出你所引用的公司章程章节。
-    """;
+// ====================================================================
+// 阶段二：应用启动期数据预热 (App Startup Initialization)
+// ====================================================================
+using (var scope = app.Services.CreateScope())
+{
+    var repo = scope.ServiceProvider.GetRequiredService<VectorKnowledgeRepository>();
+    var ingestionService = scope.ServiceProvider.GetRequiredService<KnowledgeIngestionService>();
 
-    history.AddUserMessage(dynamicTriagePrompt);
-    var settings = new PromptExecutionSettings { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() };
+    // 💥 新增：从容器中获取审计仓储实例
+    var auditRepo = scope.ServiceProvider.GetRequiredService<AuditLogRepository>();
 
-    Console.WriteLine("[中央军师 DeepSeek-V3.2 正在研判事实（基于动态常识库），静默寻址干涉工具...]");
-    var finalResult = await chatService.GetChatMessageContentAsync(history, settings, kernel);
+    Console.WriteLine("[系统自检] 正在校验 PostgreSQL 存储引擎与 DDL Schema...");
 
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.WriteLine($"\n🎙️ [地面指挥部 全网广播]:\n{finalResult.Content}\n");
-    Console.ResetColor();
+    // 校验向量知识库表
+    await repo.EnsureSchemaAsync();
+
+    // 💥 新增：执行审计日志表的自动创建
+    await auditRepo.EnsureSchemaAsync();
+
+    string corporateSopDocument = """
+        # 星河物流低空飞控核心章程 v2.6
+        ## 第一章：动力失控红线与紧急处置机制
+        凡属于低空货运序列的无人机飞行器，在执行任务期间，机载传感器触发【BatteryTemp > 65℃】核心热失控红线时，主控系统必须在一秒钟内强制剥离自主导航状态，由脑干中枢强行接管飞行权限。
+        ## 第二章：特种医疗载荷调度规则
+        若涉事飞行器的 CurrentPayload 字段标记为【RH阴性活体血浆】或【紧急特种药品】，该运单的生存优先级自动提升为 A1 级（最高级别）。调度智能体被赋予最高物理干涉主权，允许静默调用下游仓储管理系统（WMS）锁死安全冗余物资，无需人工二次审批。
+        """;
+
+    Console.WriteLine("[系统自检] 正在执行常识规章的智能切片与 Embedding 向量化沉淀...");
+    await ingestionService.IngestDocumentAsync(corporateSopDocument);
 }
 
-return;
+// ====================================================================
+// 阶段三：API 路由映射 (Endpoint Routing)
+// ====================================================================
 
+// 在 HTTP 请求管道中启用 Swagger 与可视化 UI
+app.UseSwagger();
+app.UseSwaggerUI();
+app.MapHub<AgentControlHub>("/agent-hub");
+app.UseCors("AllowFrontend");
+// 启用控制器路由体系
+app.MapControllers();
 
+Console.WriteLine("🚀 Nexus-AeroOS API 监听服务启动...");
+app.Run();
 
-
-// 💥 网络底层拦截器（必须放在 Program.cs 文件最底部）
+// ====================================================================
+// 阶段四：底层网络拦截器 (必须保留在最底部)
+// ====================================================================
 public class SiliconFlowInterceptor : DelegatingHandler
 {
     public SiliconFlowInterceptor()
     {
-        // 作用 1：无条件放行 SSL 证书，解决本地代理软件引发的 TLS 握手失败
         InnerHandler = new HttpClientHandler
         {
             ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true
@@ -141,8 +135,6 @@ public class SiliconFlowInterceptor : DelegatingHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        // 作用 2：动态路由重写
-        // 拦截底层发往 openai.com 的所有请求，强行将 Host 篡改为硅基流动的服务器
         if (request.RequestUri != null && request.RequestUri.Host.Contains("openai.com"))
         {
             request.RequestUri = new Uri($"https://api.siliconflow.cn{request.RequestUri.PathAndQuery}");
