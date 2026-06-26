@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -5,128 +6,147 @@ using Microsoft.SemanticKernel.Embeddings;
 using NexusAeroOS.AgentHarness.Agents;
 using NexusAeroOS.AgentHarness.Infrastructure;
 using NexusAeroOS.AgentHarness.Plugins;
+using NexusAeroOS.Domain.Entities;
 using NexusAeroOS.Host.Hubs;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
-
-// ====================================================================
-// 阶段一：服务注册与依赖注入 (Dependency Injection)
-// ====================================================================
+Dapper.DefaultTypeMap.MatchNamesWithUnderscores = true;
 string apiKey = "sk-fbioafzjlizupncpgjoonszbeheoxhiqndybsakwlfvwdycq";
 string pgConnectionString = "Host=localhost;Port=5432;Database=nexus_aero_os;Username=nexus_root;Password=AeroOS_Password2026!";
 
-// 1. 注册底层 HttpClient (单例)
-builder.Services.AddSingleton<HttpClient>(sp =>
-{
+// 1. 底层基础服务
+builder.Services.AddSingleton<HttpClient>(sp => {
     var client = new HttpClient(new SiliconFlowInterceptor());
-    client.Timeout = TimeSpan.FromMinutes(5); // 显式设置超时时间
+    client.Timeout = TimeSpan.FromMinutes(5);
     return client;
 });
 
-// 2. 注册 Semantic Kernel (Transient: 每次请求创建新实例，避免并发 Plugin 污染)
-builder.Services.AddTransient<Kernel>(sp =>
-{
+// 2. 语义内核
+builder.Services.AddTransient<Kernel>(sp => {
     var httpClient = sp.GetRequiredService<HttpClient>();
     var kernelBuilder = Kernel.CreateBuilder();
-    kernelBuilder.AddOpenAIChatCompletion("deepseek-ai/DeepSeek-V4-Pro", apiKey, httpClient: httpClient);
+    kernelBuilder.AddOpenAIChatCompletion("deepseek-ai/DeepSeek-V3.2", apiKey, httpClient: httpClient);
     kernelBuilder.AddOpenAITextEmbeddingGeneration("BAAI/bge-m3", apiKey, httpClient: httpClient);
     return kernelBuilder.Build();
 });
 
-// 显式将 Kernel 内部的 Embedding 服务暴露给 ASP.NET Core 外部容器
 builder.Services.AddTransient<ITextEmbeddingGenerationService>(sp =>
 {
     var kernel = sp.GetRequiredService<Kernel>();
     return kernel.GetRequiredService<ITextEmbeddingGenerationService>();
 });
 
-// 3. 注册仓储与业务服务
+// 3. 核心仓储注册 (顺序很重要，依赖方需在被依赖方之后)
+builder.Services.AddSingleton(new MissionRepository(pgConnectionString));
 builder.Services.AddSingleton(new VectorKnowledgeRepository(pgConnectionString));
-
-// 💥 修改：注册基于 Dapper 的 Postgres 审计仓储，并注入连接字符串
+builder.Services.AddSingleton(new DroneRepository(pgConnectionString));
 builder.Services.AddSingleton(new AuditLogRepository(pgConnectionString));
-// 💥 新增：注册机队状态机 (全局单例，保证大模型每次查询的都是同一个数字停机坪)
+builder.Services.AddSingleton(new ThoughtLogRepository(pgConnectionString));
 builder.Services.AddSingleton<FleetRegistryService>();
+builder.Services.AddSingleton<AirspaceService>();
+builder.Services.AddSingleton<IAgentEventBroadcaster, SignalRAgentBroadcaster>();
+builder.Services.AddSingleton<HitlApprovalService>();
+
+// 4. 业务代理与引擎
 builder.Services.AddTransient<KnowledgeIngestionService>();
 builder.Services.AddTransient<KnowledgeRetrievalService>();
 builder.Services.AddTransient<TelemetryParsingAgent>();
+builder.Services.AddTransient<DroneOnboardAgent>();
 builder.Services.AddSignalR();
-builder.Services.AddSingleton<IAgentEventBroadcaster, SignalRAgentBroadcaster>();
-builder.Services.AddSingleton<NexusAeroOS.AgentHarness.Infrastructure.HitlApprovalService>();
-builder.Services.AddTransient<NexusAeroOS.AgentHarness.Agents.DroneOnboardAgent>();
-// 新增：向容器注册控制器服务
-builder.Services.AddControllers();
 
-// 新增：注册 Swagger 核心服务与 API 资源管理器
+// 5. 挂载后台服务 (托管引擎)
+builder.Services.AddHostedService<NexusAeroOS.Host.Services.FleetPhysicsEngine>();
+builder.Services.AddHostedService<NexusAeroOS.Host.Services.OrderPumpEngine>();
+
+builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("AllowFrontend", policy =>
-    {
-        policy.WithOrigins("http://localhost:5173") // React 运行地址
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials(); // SignalR 必须允许凭证
-    });
+builder.Services.AddCors(options => {
+    options.AddPolicy("AllowFrontend", p => p.WithOrigins("http://localhost:5173").AllowAnyHeader().AllowAnyMethod().AllowCredentials());
 });
 
 var app = builder.Build();
 
 // ====================================================================
-// 阶段二：应用启动期数据预热 (App Startup Initialization)
+// 数据自愈与启动协议
 // ====================================================================
 using (var scope = app.Services.CreateScope())
 {
-    var repo = scope.ServiceProvider.GetRequiredService<VectorKnowledgeRepository>();
-    var ingestionService = scope.ServiceProvider.GetRequiredService<KnowledgeIngestionService>();
+    var sp = scope.ServiceProvider;
+    var droneRepo = sp.GetRequiredService<DroneRepository>();
+    var missionRepo = sp.GetRequiredService<MissionRepository>();
+    var thoughtRepo = sp.GetRequiredService<ThoughtLogRepository>();
+    var repo = sp.GetRequiredService<VectorKnowledgeRepository>();
+    var registry = sp.GetRequiredService<FleetRegistryService>();
+    var ingestion = sp.GetRequiredService<KnowledgeIngestionService>();
 
-    // 💥 新增：从容器中获取审计仓储实例
-    var auditRepo = scope.ServiceProvider.GetRequiredService<AuditLogRepository>();
-
-    Console.WriteLine("[系统自检] 正在校验 PostgreSQL 存储引擎与 DDL Schema...");
-
-    // 校验向量知识库表
+    Console.WriteLine("🚀 [系统自检] 正在同步数据架构与资产状态...");
+    await droneRepo.EnsureSchemaAndSeedAsync();
+    await missionRepo.EnsureSchemaAsync();
+    await thoughtRepo.EnsureSchemaAsync();
     await repo.EnsureSchemaAsync();
 
-    // 💥 新增：执行审计日志表的自动创建
-    await auditRepo.EnsureSchemaAsync();
+    // 加载机队资产
+    using var conn = new NpgsqlConnection(pgConnectionString);
+    var dbDrones = await conn.QueryAsync<DroneState>("SELECT * FROM sys_drone_assets");
+    registry.LoadFleetFromDatabase(dbDrones);
 
-    string corporateSopDocument = """
-        # 星河物流低空飞控核心章程 v2.6
-        ## 第一章：动力失控红线与紧急处置机制
-        凡属于低空货运序列的无人机飞行器，在执行任务期间，机载传感器触发【BatteryTemp > 65℃】核心热失控红线时，主控系统必须在一秒钟内强制剥离自主导航状态，由脑干中枢强行接管飞行权限。
-        ## 第二章：特种医疗载荷调度规则
-        若涉事飞行器的 CurrentPayload 字段标记为【RH阴性活体血浆】或【紧急特种药品】，该运单的生存优先级自动提升为 A1 级（最高级别）。调度智能体被赋予最高物理干涉主权，允许静默调用下游仓储管理系统（WMS）锁死安全冗余物资，无需人工二次审批。
-        """;
+    // 💥 守望者协议：断点续传
+    var ongoing = await missionRepo.GetActiveMissionsAsync();
+    foreach (var m in ongoing)
+    {
+        var drone = registry.GetFleetSnapshot().FirstOrDefault(d => d.DroneId == m.DroneId);
+        if (drone != null)
+        {
+            drone.CurrentTaskId = m.TaskId;
+            drone.CurrentOrderId = m.OrderId;
+            drone.WaypointQueue.Clear();
+            foreach (var wp in m.Waypoints.Split(';')) drone.WaypointQueue.Enqueue(wp.Trim());
+            if (drone.WaypointQueue.TryDequeue(out var firstWp))
+            {
+                drone.CurrentTargetWaypoint = firstWp;
+                drone.IsInMotion = true;
+                drone.Status = DroneStatus.FlyingToDeliver;
+                Console.WriteLine($"♻️ [断点复原] 无人机 {drone.DroneId} 续接任务 {m.OrderId}");
+            }
+        }
+    }
 
-    Console.WriteLine("[系统自检] 正在执行常识规章的智能切片与 Embedding 向量化沉淀...");
-    await ingestionService.IngestDocumentAsync(corporateSopDocument);
+    await ingestion.IngestDocumentAsync("# 核心章程...");
 }
 
-// ====================================================================
-// 阶段三：API 路由映射 (Endpoint Routing)
-// ====================================================================
-
-// 在 HTTP 请求管道中启用 Swagger 与可视化 UI
 app.UseSwagger();
 app.UseSwaggerUI();
 app.MapHub<AgentControlHub>("/agent-hub");
 app.UseCors("AllowFrontend");
-// 启用控制器路由体系
 app.MapControllers();
 
-Console.WriteLine("🚀 Nexus-AeroOS API 监听服务启动...");
+// 数据分析 API 终端
+app.MapGet("/api/telemetry/missions/history", async ([FromServices] MissionRepository repo) => {
+    using var conn = new NpgsqlConnection(pgConnectionString);
+    return Results.Ok(await conn.QueryAsync("SELECT * FROM sys_mission_ledger ORDER BY created_at DESC LIMIT 50"));
+});
+app.MapGet("/api/telemetry/missions/drone/{droneId}", async (string droneId, [FromServices] MissionRepository repo) => {
+    using var conn = new NpgsqlConnection(pgConnectionString);
+    return Results.Ok(await conn.QueryAsync("SELECT * FROM sys_mission_ledger WHERE drone_id = @dId ORDER BY created_at DESC LIMIT 5", new { dId = droneId }));
+});
+app.MapGet("/api/telemetry/thoughts/analytics", async ([FromServices] ThoughtLogRepository repo) => {
+    using var conn = new NpgsqlConnection(pgConnectionString);
+    return Results.Ok(await conn.QueryAsync("SELECT * FROM sys_brain_thought_ledger ORDER BY created_at DESC LIMIT 100"));
+});
+
+Console.WriteLine("🚀 服务运行中...");
 app.Run();
 
 // ====================================================================
-// 阶段四：底层网络拦截器 (必须保留在最底部)
+// 底层网络拦截器
 // ====================================================================
 public class SiliconFlowInterceptor : DelegatingHandler
 {
     public SiliconFlowInterceptor()
     {
+        // 💥 补回被我精简掉的底层发包器（InnerHandler）！
         InnerHandler = new HttpClientHandler
         {
             ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true
@@ -135,10 +155,8 @@ public class SiliconFlowInterceptor : DelegatingHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        if (request.RequestUri != null && request.RequestUri.Host.Contains("openai.com"))
-        {
+        if (request.RequestUri?.Host.Contains("openai.com") == true)
             request.RequestUri = new Uri($"https://api.siliconflow.cn{request.RequestUri.PathAndQuery}");
-        }
         return await base.SendAsync(request, cancellationToken);
     }
 }
